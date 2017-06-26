@@ -1,0 +1,585 @@
+/*
+   【F1】
+    @Author:Winter
+    @改造:Anson
+    @Date:2016-08-9
+    @Funtion:作为Controller使用,调用对应class来做相应逻辑,建议任何逻辑都写在对应的class中
+    ============================================================================
+   【F2】
+    @Author: Eric
+    @Date: 2015.09.22
+    @Function: 
+    1.更新业务机会阶段
+    2.创建对应Task
+    @Modify:Winter
+    @Date:2016-6-6
+    1.不再创建对应Task
+    ============================================================================
+   【F3】
+    @Author：King
+    @Date：2015-10-12
+    @Function:合同的状态为激活时，将房产客户中的”是否业主”置为 true
+    ===========================================================================
+   【F4】
+    @Author:Don
+    @Date:2016.09.22
+    @Function:签约单创建或更新时（有效的签约单），在关联房产下创建服务客户。
+    @Test:SVC_ContractCreateServiceCstTest
+
+    @author:charles
+    @modify：增加新逻辑，旧逻辑根据交易单生成服务客户，新逻辑根据签约单生成。旧逻辑中交易客户关系挂在交易上，新逻辑交易客户关系挂在签约单上，
+    改造合并，在F4处做了新逻辑和新函数SVC_ContractCreateServiceCstComm2。
+
+
+            将原本逻辑的身份判断如 //if(ServiceCst.Name == TradeCst.Customer__r.LastName  && ServiceCst.Identify_No__c == TradeCst.Customer__r.Identify1__c)
+                改为用房间GUID+客户GUID拼接判断
+                最后的insert update 全部改为根据SCGUID__c upsert
+    @date 2017.4.25
+
+*/
+public class DM_ContractHandler implements Triggers.Handler
+{
+    public void Handle()
+    {
+        if(trigger.isBefore && trigger.isUpdate)
+        {
+            this.bUController_Contract();//F1
+        }
+        if(trigger.isAfter && trigger.isInsert)
+        {
+            this.aIContractUpdateField();
+            this.aIController_Contract();//F1
+            this.aIUpdateRealEstateClientsHomeStateOnContract();//F3
+            this.aISVC_ContractCreateServiceCst();//F4
+        }
+        if(trigger.isAfter && trigger.isUpdate)
+        {
+            this.aUController_Contract();//F1
+            this.aUUpdateRealEstateClientsHomeStateOnContract();//F3
+            this.aUSVC_ContractCreateServiceCst();//F4
+        }
+    }
+
+    //========================F1=============================
+    public void bUController_Contract()
+    {
+        Map<Id, Contract__c> newContractMaps = (Map<Id, Contract__c>)trigger.newMap;
+        Map<Id, Contract__c> oldContractMaps = (Map<Id, Contract__c>)trigger.oldMap;
+        ContractHandler.ContractBeforeUpdateAction(newContractMaps, oldContractMaps);
+    }
+
+    public void aIController_Contract()
+    {
+        Set<String> roomIDset = new Set<String>();
+
+        Set<ID> contractIdSet = new Set<ID>();
+        for(Contract__c contract : (List<Contract__c>)trigger.new)
+        {
+            contractIdSet.add(contract.id);
+            if(contract.Room__c != null)
+            {
+                roomIDset.add(contract.Room__c);
+            }
+        }
+        if(contractIdSet.size() > 0)
+        {
+            //客户签约信息通知
+            PB_CstStatusContractNotifi_V2.CstStatusContractNotifiAction(new List<Id>(contractIdSet));
+        }
+
+        if(roomIDset.size() > 0)
+        {
+            ContractHandler.UpdateRoomContractInfo(roomIDset);
+        }
+    }
+
+    //add by winter 2016-9-1 同享会通知添加状态变化(认筹 认购 签约 状态变化也要通知同享会)
+    public void aUController_Contract() 
+    {
+        Set<String> roomIDset = new Set<String>();
+
+        Set<ID> contractIdSet = new Set<ID>();
+        Map<Id, Contract__c> oldContractMaps = (Map<Id, Contract__c>)trigger.oldMap;
+        for(Contract__c newContract : (List<Contract__c>)trigger.new)
+        {
+            Contract__c oldContract = oldContractMaps.get(newContract.Id);
+            if(newContract.Status__c != oldContract.Status__c
+               || newContract.Contract_Price__c != oldContract.Contract_Price__c
+               || newContract.Signature_Date__c != oldContract.Signature_Date__c
+               || newContract.LaunchDate__c != oldContract.LaunchDate__c
+              )
+            {
+                if(contract.Room__c != null)
+                {
+                    roomIDset.add(newContract.Room__c);
+                }
+            }
+            if(newContract.Status__c != oldContract.Status__c)
+            {
+                contractIdSet.add(newContract.id);
+            }
+        }
+        if(contractIdSet.size() > 0)
+        {
+            //客户签约信息通知
+            PB_CstStatusContractNotifi_V2.CstStatusContractNotifiAction(new List<Id>(contractIdSet));
+        }
+
+        if(roomIDset.size() > 0)
+        {
+            ContractHandler.UpdateRoomContractInfo(roomIDset);
+        }
+    }
+
+    //=========================F3=================================================
+    public void aIContractUpdateField()
+    {
+        final String stageName = '签约';
+        List<Contract__c> contractList = new List<Contract__c>();//签约
+        Set<Id> accIDs = new Set<Id>();//客户Ids
+        Set<Id> oppIDs = new Set<Id>();//OppIds
+        String salesforceOrgID = UserInfo.getOrganizationId();
+
+        for(Contract__c con : (List<Contract__c>)trigger.new)
+        {
+            if(con.Trade__c != null && con.Account__c != null)
+            {
+                contractList.add(con);
+                accIDs.add(con.Account__c);
+            } 
+            if(con.Opportunity__c != null)
+            {
+                oppIDs.add(con.Opportunity__c);    
+            }
+        } 
+
+        //更新业务机会阶段
+        if(oppIDs.size() > 0)
+        {
+            List<Opportunity> opps = [select Id,
+                                      StageName,
+                                      ContractSignature_Date__c,
+                                      ContractTotal_Price_Rmb__c,
+                                      (Select Id From Booking__r limit 1), 
+                                      (Select Id From SalesOrder__r limit 1), 
+                                      (Select Id,Signature_Date__c,Total_Price_Rmb__c From Contract__r limit 1), 
+                                      (Select Id From Collection__r limit 1) 
+                                      from Opportunity where Id in: oppIDs];
+
+            Util.UpdateOppStageName(opps, stageName);
+            for(Opportunity opp : opps)
+            {
+                if(opp.Contract__r.size()>0)
+                {
+                    opp.ContractSignature_Date__c = opp.Contract__r[0].Signature_Date__c;
+                    opp.ContractTotal_Price_Rmb__c = opp.Contract__r[0].Total_Price_Rmb__c;
+                }
+            }
+            update opps;
+        }
+
+    }
+
+    public void aIUpdateRealEstateClientsHomeStateOnContract()
+    {
+        final String status = '激活';
+        Set<Id> tradeIDs = new Set<Id>();
+
+        for(Contract__c con : (List<Contract__c>)trigger.new)
+        {
+            if(con.Trade__c != null && con.Status__c == status)
+                tradeIDs.add(con.Trade__c);
+        }
+        UpdateRealEstateClientsHomeStateOnContractComm(tradeIDs);
+    }
+
+    public void aUUpdateRealEstateClientsHomeStateOnContract()
+    {
+        final String status = '激活';
+        Set<Id> tradeIDs = new Set<Id>();
+
+        for(Contract__c newCon : (List<Contract__c>)trigger.new)
+        {
+            Contract__c oldCon = ((Map<id,Contract__c>)trigger.oldMap).get(newCon.Id);
+            if(newCon.Trade__c != null && newCon.Status__c != oldCon.Status__c && newCon.Status__c == status)
+                tradeIDs.add(newCon.Trade__c);
+        }
+        UpdateRealEstateClientsHomeStateOnContractComm(tradeIDs);
+    }
+
+    public void UpdateRealEstateClientsHomeStateOnContractComm(Set<Id> tradeIDs)
+    {
+        final String status = '激活';
+        if(tradeIDs.size() == 0)
+            return;
+
+        /*
+        1.将交易下的激活的的签约单上的“合同金额RMB”赋值到交易上
+        2.将激活签约上的交易的所有客户的“是否为万科业主” = True
+    */
+        Set<ID> customerIDs = new Set<ID>();//用于去重
+        List<Trade__c> upTrades = new List<Trade__c>();
+        List<Account> upAccounts = new List<Account>();
+        for(Trade__c tra : [select HTotal__c,
+                            (select Id,Customer__c,Customer__r.IsOwner__c from Trade_Trade2Cst__r where Customer__r.IsOwner__c = false),
+                            (select Total_Price_Rmb__c From Contract__r where Status__c =: status) 
+                            from Trade__c 
+                            where Id in:tradeIDs])
+        {
+            tra.HTotal__c = 0;
+            if(tra.Contract__r.size() > 0)
+            {
+                tra.HTotal__c = tra.Contract__r[0].Total_Price_Rmb__c;
+                upTrades.add(tra);
+                for(Trade2Cst__c t2c : tra.Trade_Trade2Cst__r)
+                {
+                    t2c.Customer__r.IsOwner__c = true;
+                    if(!customerIDs.contains(t2c.Customer__c))
+                    {
+                        customerIDs.add(t2c.Customer__c);
+                        upAccounts.add(t2c.Customer__r);
+                    }
+                }
+            }
+        }
+
+        if(upAccounts.size() > 0)
+        {
+            update upAccounts;    
+        }
+
+        if(upTrades.size() > 0)
+        {
+            update upTrades;    
+        }
+    }
+
+    //===============================F4==============================================
+    public void aISVC_ContractCreateServiceCst()
+    {
+        Set<Id> Set_TradeIds = new Set<Id>();//交易Id
+        Set<Id> Set_RoomIds = new Set<Id>();//房间Id
+        //Set<Id> Set_RoomIds2 = new Set<Id>();//房间Id
+        //Set<id> Set_ContractIds = new Set<ID>();//签约单ID
+        //Set<id> Set_ContractIds2 = new Set<ID>();//签约单ID
+        for(Contract__c newContract : (list<Contract__c>)trigger.new)
+        {
+
+            //旧逻辑
+            if(newContract.Status__c == '激活' && newContract.Trade__c != null && newContract.SSID__c == null && newContract.Room__c !=null)
+            {
+                Set_TradeIds.add(newContract.Trade__c);
+                Set_RoomIds.add(newContract.Room__c);
+                //Set_ContractIds.add(newContract.id);
+            }
+            /*
+            //新逻辑
+            if( newContract.Status__c == '激活' && newContract.SSID__c != null && newContract.Room__c != null)
+            {
+                Set_RoomIds2.add(newContract.Room__c);
+                Set_ContractIds2.add(newContract.id);
+            }
+            */
+        }
+        //旧逻辑
+		if(Set_TradeIds.size()>0 && Set_RoomIds.size()>0)
+        	SVC_ContractCreateServiceCstComm(Set_TradeIds,Set_RoomIds);
+        /*
+        //新逻辑
+        if(Set_ContractIds2.size()>0 && Set_RoomIds2.size()>0)
+        SVC_ContractCreateServiceCstComm_New(Set_ContractIds2,Set_RoomIds2);
+        */
+    }
+
+    public void aUSVC_ContractCreateServiceCst()
+    {
+        Set<Id> Set_TradeIds = new Set<Id>();//交易Id
+        Set<Id> Set_RoomIds = new Set<Id>();//房间Id
+        Set<Id> Set_RoomIds2 = new Set<Id>();//房间Id
+        Set<id> Set_ContractIds = new Set<ID>();//签约单ID
+        for(Contract__c newContract : (list<Contract__c>)trigger.new)
+        {
+            Contract__c oldContract = ((Map<id,Contract__c>)trigger.oldMap).get(newContract.Id);
+            //旧逻辑
+            if(newContract.Status__c != oldContract.Status__c  && newContract.Trade__c != null && newContract.SSID__c == null && newContract.Room__c != null)
+            {
+                Set_TradeIds.add(newContract.Trade__c);
+                Set_RoomIds.add(newContract.Room__c);
+            }
+            //新逻辑
+            if( (newContract.Status__c != oldContract.Status__c)
+               && newContract.SSID__c != null && newContract.Room__c != null)
+            {
+                Set_RoomIds2.add(newContract.Room__c);
+                Set_ContractIds.add(newContract.id);
+            }
+        }
+
+        //旧逻辑
+        if(Set_TradeIds.size()>0 && Set_RoomIds.size()>0)
+        SVC_ContractCreateServiceCstComm(Set_TradeIds,Set_RoomIds);
+        //新逻辑
+        if(Set_ContractIds.size()>0 && Set_RoomIds2.size()>0)
+        SVC_ContractCreateServiceCstComm_New(Set_ContractIds,Set_RoomIds2);
+    }
+
+    //----------------------------------------------旧逻辑----------------------------
+    public void SVC_ContractCreateServiceCstComm(Set<Id> Set_TradeIds,Set<Id> Set_RoomIds)
+    {
+        //房间及对应的交易客户数据
+        Map<Id,List<Trade2Cst__c>> Map_RoomCst = new Map<Id,List<Trade2Cst__c>>();
+        //房间及对应是否有激活合同
+        Map<Id,Boolean> Map_IsActiveContract =new Map<Id,Boolean>();
+        List<Trade__c> trades = [select Id
+                                 ,Room__c,Room__r.MYGUID__c
+                                 ,(select Status__c from Contract__r where Status__c ='激活' and SSID__c = null)
+                                 ,(select Customer__r.LastName,Customer__r.IdentifyType1__c,Customer__r.Identify1__c,Customer__r.Phone
+                                           ,Customer__r.Address__c,Customer__r.Gender__c,IsDeleted__c,Trade__r.Room__r.MYGUID__c ,Customer__r.MYGUID__c
+                                          from Trade_Trade2Cst__r order By lastmodifiedDate desc) 
+                                 from Trade__c where Id=: Set_TradeIds and Room__c !=null];
+        if(trades.size() == 0) return;
+        //注册用户List，后面创建服务客户时关联注册用户用
+        Set<String> ruSet = new Set<String>();
+        
+        for(Trade__c trade : trades)
+        {
+            //包含激活的签约单
+            if(trade.Contract__r!=null && trade.Contract__r.size()>0)
+            {
+                Map_IsActiveContract.put(trade.Room__c,True);
+            }
+            else
+            {
+                Map_IsActiveContract.put(trade.Room__c,false);
+            }
+            //去除重复交易客户的List
+            List<Trade2Cst__c> tempList = new List<Trade2Cst__c>();
+            //去除重复交易客户的Set
+            Set<String> tempSet = new Set<String>();
+
+            //房间及对应的交易客户数据
+            for(Trade2Cst__c TradeCst : trade.Trade_Trade2Cst__r)
+            {
+                if(TradeCst.Customer__r.Identify1__c!=null)
+                    ruSet.add(TradeCst.Customer__r.Identify1__c);
+                String SCGUID = trade.Room__r.MYGUID__c+TradeCst.Customer__r.MYGUID__c;
+                //不存在相同SCGUID时
+                if(!tempSet.contains(SCGUID))
+                {
+                    tempSet.add(SCGUID);
+                    tempList.add(TradeCst);
+                }
+                //存在相同SCGUID时，取有效的交易客户
+                else{
+                 if(TradeCst.IsDeleted__c == false)
+                    {
+                        //找到相同GUID的交易客户，删除掉，将新的有效的交易客户加入List
+                        Integer temp = 0;
+                    for(Trade2Cst__c tc:tempList)
+                        {
+                            if(tc.Trade__r.Room__r.MYGUID__c+tc.Customer__r.MYGUID__c == SCGUID)
+                            {
+                             tempList.remove(temp);
+                                tempList.add(TradeCst);
+                                break;
+                            }
+                            temp++;
+                        }
+                    }
+                }
+            }
+            
+            Map_RoomCst.put(trade.Room__c,tempList);
+        }
+        //保存注册用户Set
+        List<Register_User__c> ruList = [select id,Identify_No__c from Register_User__c where Identify_No__c in: ruSet];
+        
+        List<Service_Cst__c> serviceCsts = new List<Service_Cst__c>();
+        for(Id RoomId : Set_RoomIds)
+        {
+            Boolean temp = false;
+            if(Map_IsActiveContract.containsKey(RoomId) && Map_IsActiveContract.get(RoomId))
+            {
+                temp = true;
+            }
+
+            for(Trade2Cst__c TradeCst : Map_RoomCst.get(RoomId))
+            {
+                Service_Cst__c serviceCst = new Service_Cst__c();
+                //关联注册用户
+                for(Register_User__c ru : ruList)
+                {
+                    if(ru.Identify_No__c==TradeCst.Customer__r.Identify1__c)
+                    {
+                    	serviceCst.Register_User__c=ru.id;
+                        break;
+                    }
+                }
+                serviceCst.SCGUID__c = TradeCst.Trade__r.Room__r.MYGUID__c + TradeCst.Customer__r.MYGUID__c;
+                serviceCst.Room__c = RoomId;
+                serviceCst.Name = TradeCst.Customer__r.LastName;
+                serviceCst.Phone__c = TradeCst.Customer__r.Phone;
+                serviceCst.Identify_Type__c = TradeCst.Customer__r.IdentifyType1__c;
+                serviceCst.Identify_No__c = TradeCst.Customer__r.Identify1__c;
+                serviceCst.Sex__c = TradeCst.Customer__r.Gender__c;
+                serviceCst.Address__c = TradeCst.Customer__r.Address__c;
+                serviceCst.Type__c = '业主';
+                serviceCst .Approval_Status__c = '已通过';
+
+                if(temp)
+                    serviceCst.Status__c = (TradeCst.IsDeleted__c ? '无效' : '有效');
+                else
+                    serviceCst.Status__c = '无效';
+
+                serviceCsts.add(serviceCst);
+            }
+        }
+        //system.debug('=====================================旧逻辑');
+        if(serviceCsts.size() > 0) upsert serviceCsts SCGUID__c;
+
+    }
+
+
+    //生成服务客户新逻辑(新销售系统中没有交易单，故原逻辑按照交易生成服务客户，改成按照签约单生成)
+    public void SVC_ContractCreateServiceCstComm_New(Set<id> Set_ContractIds, Set<id> Set_RoomIds)
+    {
+        //房间及对应的交易客户数据
+        Map<Id,List<Trade2Cst__c>> Map_RoomCst = new Map<Id,List<Trade2Cst__c>>();
+        //房间及对应是否有激活合同
+        Map<Id,Boolean> Map_IsActiveContract = new Map<Id,Boolean>();
+
+        for(Room__c room : [select Id
+                            ,(select Id from ContractdGLk__r where Status__c = '激活')
+                            from Room__c
+                            where Id in: Set_RoomIds])
+        {
+            if(room.ContractdGLk__r.size() > 0) 
+                Map_IsActiveContract.put(room.Id, True);
+            else 
+                Map_IsActiveContract.put(room.Id, false);
+        }
+        List<Contract__c> contracts = [select Id
+                              ,Room__c,SSID__c,Room__r.MYGUID__c,Room__r.SSID__c
+                              ,Status__c,Room__r.ContractSignatureDate__c,Room__r.LaunchDate__c,LaunchDate__c,Signature_Date__c
+                              ,(select Customer__r.LastName,Customer__r.IdentifyType1__c,Customer__r.Identify1__c,Customer__r.Phone,Customer__r.Address__c,Customer__r.Gender__c
+                                ,Is_Deleted__c,IsDeleted__c,Customer__r.MYGUID__c,Trade__r.Room__r.MYGUID__c,Contract__r.Room__r.MYGUID__c,Contract__r.SSID__c,Customer__r.SSID__c,Contract__r.Room__r.SSID__c
+                                from Trade2Csts__r order By lastmodifiedDate desc)
+                              from Contract__c
+                              where Id in: Set_ContractIds and Room__c != null];
+        //创建服务客户时关联注册用户用
+        Set<String> ruSet = new Set<String>();
+        for(Contract__c ct : contracts)
+        {
+            //去除重复交易客户的List
+            List<Trade2Cst__c> tempList = new List<Trade2Cst__c>();
+            //去除重复交易客户的Set
+            Set<String> tempSet = new Set<String>();
+
+            //房间及对应的交易客户数据
+            for(Trade2Cst__c TradeCst : ct.Trade2Csts__r)
+            {
+                if(TradeCst.Customer__r.Identify1__c!=null)
+                    ruSet.add(TradeCst.Customer__r.Identify1__c);
+                String SCGUID;
+				Boolean IsUseMY = false;
+                if(TradeCst.Contract__r.Room__r.MYGUID__c != null && TradeCst.Customer__r.MYGUID__c != null)
+                {
+                    SCGUID = TradeCst.Contract__r.Room__r.MYGUID__c+TradeCst.Customer__r.MYGUID__c;
+                    IsUseMY = true;
+                }
+                else
+                {
+                    SCGUID = TradeCst.Contract__r.Room__r.SSID__c+TradeCst.Customer__r.SSID__c;  
+                }
+                //不存在相同SCGUID时
+                if(!tempSet.contains(SCGUID))
+                {
+                    tempSet.add(SCGUID);
+                    tempList.add(TradeCst);
+                }
+                //存在相同SCGUID时，取有效的交易客户
+                else
+                {
+                    //找到相同GUID的交易客户，删除掉，将新的有效的交易客户加入List
+                        if(TradeCst.Is_Deleted__c == false)
+                        {
+                            Integer temp = 0;
+                            for(Trade2Cst__c tc:tempList)
+                            {
+                                String SCGUID2;
+                                if(IsUseMY)
+                                {
+                                SCGUID2 = tc.Contract__r.Room__r.MYGUID__c+tc.Customer__r.MYGUID__c;
+                                }
+                                else
+                                {
+                                 SCGUID2 = tc.Contract__r.Room__r.SSID__c+tc.Customer__r.SSID__c;   
+                                }
+                                if(SCGUID2 == SCGUID)
+                                {
+                                    tempList.remove(temp);
+                                    tempList.add(TradeCst);
+                                    break;
+                                }
+                                temp++;
+                            }
+                        }
+                }
+            }
+            Map_RoomCst.put(ct.Room__c,tempList);
+        }
+        
+        //保存注册用户Set
+        List<Register_User__c> ruList = [select id,Identify_No__c from Register_User__c where Identify_No__c in: ruSet];
+        
+        List<Service_Cst__c> serviceCsts = new List<Service_Cst__c>();
+        for(Id RoomId : Set_RoomIds)
+        {
+            Boolean temp = false;
+            if(Map_IsActiveContract.containsKey(RoomId) && Map_IsActiveContract.get(RoomId))
+            {
+                temp = true;
+            }
+
+            for(Trade2Cst__c TradeCst : Map_RoomCst.get(RoomId))
+            {
+                Service_Cst__c serviceCst = new Service_Cst__c();
+                if(TradeCst.Contract__r.Room__r.MYGUID__c != null && TradeCst.Customer__r.MYGUID__c != null)
+                {
+                    serviceCst.SCGUID__c =TradeCst.Contract__r.Room__r.MYGUID__c+TradeCst.Customer__r.MYGUID__c;
+                }
+                else
+                {
+                    serviceCst.SCGUID__c = TradeCst.Contract__r.Room__r.SSID__c+TradeCst.Customer__r.SSID__c;  
+                }
+                //关联注册用户
+                for(Register_User__c ru : ruList)
+                {
+                    if(ru.Identify_No__c==TradeCst.Customer__r.Identify1__c)
+                    {
+                    	serviceCst.Register_User__c=ru.id;
+                        break;
+                    }
+                }
+                serviceCst.Room__c = RoomId;
+                serviceCst.Name = TradeCst.Customer__r.LastName;
+                serviceCst.Phone__c = TradeCst.Customer__r.Phone;
+                serviceCst.Identify_Type__c = TradeCst.Customer__r.IdentifyType1__c;
+                serviceCst.Identify_No__c = TradeCst.Customer__r.Identify1__c;
+                serviceCst.Sex__c = TradeCst.Customer__r.Gender__c;
+                serviceCst.Address__c = TradeCst.Customer__r.Address__c;
+                serviceCst.Type__c = '业主';
+                serviceCst.Approval_Status__c = '已通过';
+
+                if(temp)
+                    serviceCst.Status__c = (TradeCst.Is_Deleted__c ? '无效' : '有效');
+                else
+                    serviceCst.Status__c = '无效';
+
+                serviceCsts.add(serviceCst);
+            }
+        }
+        //system.debug('=====================================新逻辑');
+        if(serviceCsts.size() > 0) upsert serviceCsts SCGUID__c;
+    }
+}
